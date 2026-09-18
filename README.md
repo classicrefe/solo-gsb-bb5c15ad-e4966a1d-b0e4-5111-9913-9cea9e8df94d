@@ -36,6 +36,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   ],
   "locked_groups": [
     { "left_ids": ["L1"], "right_ids": ["R1", "R2"] }
+  ],
+  "excluded_pairs": [
+    { "left_id": "L1", "right_id": "R9" }
   ]
 }
 ```
@@ -80,6 +83,45 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 “核销金额绝对值总和最大 + 组编码列表字典序最小”求解。最终 `groups` 为锁定组与
 自由求解结果的合并（仍按组编码升序），`total_amount` 与 `unmatched_*` 均按合并结果计算。
 
+### 排除流水对（`excluded_pairs`，可选）
+
+操作员可通过 `excluded_pairs` 声明**绝不能归入同一核销组**的左右流水对；数组每项包含
+`left_id` 与 `right_id`：
+
+```json
+"excluded_pairs": [
+  { "left_id": "L1", "right_id": "R1" }
+]
+```
+
+- `left_id` 必须引用本批次 left 中**存在**的 ID，`right_id` 必须引用本批次 right 中
+  **存在**的 ID（侧别写反——如把 right ID 填进 `left_id`——同样视为引用错误）；
+- 数组内不得出现重复对（`left_id` 与 `right_id` 完全相同即重复）。
+
+任一条件不满足均返回 **422**，错误 `loc` 为
+`["body", "excluded_pairs", <序号>]`，`<序号>` 为出问题项从 0 开始的下标
+（按数组顺序报告首个错误）：
+
+```json
+{
+  "detail": [
+    {
+      "type": "excluded_pair.invalid",
+      "loc": ["body", "excluded_pairs", 0],
+      "msg": "excluded_pairs[0]: unknown left transaction id: L9",
+      "input": { "left_id": "L9", "right_id": "R1" }
+    }
+  ]
+}
+```
+
+求解时，**只要候选组内同时包含某个排除对的两条流水，该候选组直接剔除**——排除对不影响
+组合法性本身（金额、时间等规则不变），只是带排除对的合法组不再参与最大核销额与字典序求解；
+其余候选组仍按原规则选出最优解，响应结构不变。不传该字段或传 `[]` / `null` 时，
+结果与原行为**完全一致**（幂等指纹也与无该字段时相同）。
+
+若人工 `locked_groups` 中的某个组命中排除对（即该组被排除规则剔除），同样返回 **422**，
+错误 `loc` 定位到对应的 `locked_groups` 项下标，**不会静默忽略**排除规则。
 
 **核销组规则**
 
@@ -143,14 +185,15 @@ curl -X POST http://localhost:8000/reconcile \
 
 ## 算法
 
-1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；
+1. 枚举全部合法候选组（每侧 ≤12 笔，候选上限约 7000 个）；枚举时若组内同时包含某个
+   `excluded_pairs` 排除对的两条流水，则该组不生成候选；
 2. 以位掩码表示流水集合，用带备忘录的分支限界（MRV 选点 + 双侧金额和上界 +
    贪心下界）求任意子集的最大可核销权值；
 3. 在达到最大权值的前提下，逐步选取能构成残余最优解中编码最小的候选组，
    得到字典序最小的最优解。
 
-存在 `locked_groups` 时，先将全部锁定组（已通过同样的合法性校验）对应的流水从
-位掩码中剔除，再对剩余掩码执行步骤 2、3，最后把锁定组并入结果。
+存在 `locked_groups` 时，先将全部锁定组（已通过同样的合法性校验，且不含任何排除对）
+对应的流水从位掩码中剔除，再对剩余掩码执行步骤 2、3，最后把锁定组并入结果。
 
 实测 12×12 极端稠密批次求解耗时约 50ms 以内。
 
@@ -161,7 +204,8 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups` 的场景）。
+包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
+`excluded_pairs` 及两者组合的场景）。
 
 ## 项目结构
 

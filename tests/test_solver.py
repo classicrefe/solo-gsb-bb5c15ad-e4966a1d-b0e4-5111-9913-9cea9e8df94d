@@ -6,7 +6,15 @@ import random
 
 import pytest
 
-from app.solver import LockedGroup, Reconciler, Txn, resolve_locked_groups
+from app.solver import (
+    ExcludedPair,
+    ExcludedPairError,
+    LockedGroup,
+    Reconciler,
+    Txn,
+    resolve_excluded_pairs,
+    resolve_locked_groups,
+)
 
 BASE_TS = 1_758_000_000.0  # fixed epoch for reproducibility
 
@@ -15,10 +23,10 @@ def make_txn(id: str, amount: int, ts: float = BASE_TS) -> Txn:
     return Txn(id=id, ts=ts, amount=amount)
 
 
-def brute_force(left: list[Txn], right: list[Txn]):
+def brute_force(left: list[Txn], right: list[Txn], excluded=()):
     """Enumerate every packing of legal candidates; return (max weight,
     lexicographically smallest sorted encoding list among max-weight packings)."""
-    rec = Reconciler(left, right)
+    rec = Reconciler(left, right, excluded=excluded)
     cands = rec.candidates
     by_txn: list[list[int]] = [[] for _ in rec.txns]
     for ci, c in enumerate(cands):
@@ -59,8 +67,8 @@ def brute_force(left: list[Txn], right: list[Txn]):
     return best_weight, (best_enc or [])
 
 
-def solve(left: list[Txn], right: list[Txn]):
-    groups = Reconciler(left, right).solve()
+def solve(left: list[Txn], right: list[Txn], excluded=()):
+    groups = Reconciler(left, right, excluded=excluded).solve()
     weight = sum(g.weight for g in groups)
     enc = sorted(g.encoding for g in groups)
     return weight, enc
@@ -131,6 +139,116 @@ def test_large_random_batch_completes():
 
 
 # --------------------------------------------------------------------- #
+# excluded pairs
+# --------------------------------------------------------------------- #
+def test_excluded_pair_candidate_generation_filters_groups():
+    # (A,[X,Y]) is legal but forbidden through X; it must not be a candidate
+    left = [make_txn("A", 300)]
+    right = [make_txn("X", 100), make_txn("Y", 200), make_txn("Z", 300)]
+    rec = Reconciler(left, right, excluded={("A", "X")})
+    encs = {c.encoding for c in rec.candidates}
+    assert (("A",), ("X", "Y")) not in encs
+    assert (("A",), ("X",)) not in encs
+    assert (("A",), ("Y",)) not in encs  # amounts differ anyway
+    assert (("A",), ("Z",)) in encs
+    # relative to an unconstrained batch only the forbidden group disappears
+    assert (
+        {c.encoding for c in Reconciler(left, right).candidates} - encs
+        == {(("A",), ("X", "Y"))}
+    )
+
+
+def test_excluded_pair_one_to_many_optimum():
+    # without the exclusion (A+B,Y)=300 wins; excluding (B,Y) leaves (A,X)=100
+    left = [make_txn("A", 100), make_txn("B", 200)]
+    right = [make_txn("X", 100), make_txn("Y", 300)]
+    weight, enc = solve(left, right, {("B", "Y")})
+    assert weight == 100
+    assert enc == [(("A",), ("X",))]
+
+
+def test_excluded_pair_lex_tie_break_preserved():
+    # the default lex-smallest perfect matching is ruled out; the result must
+    # still be the lex-smallest encoding list among the remaining optima
+    left = [make_txn("A", 100), make_txn("B", 100)]
+    right = [make_txn("X", 100), make_txn("Y", 100)]
+    weight, enc = solve(left, right, {("A", "X")})
+    assert (weight, enc) == (
+        200,
+        [(("A",), ("Y",)), (("B",), ("X",))],
+    )
+
+
+def test_resolve_excluded_pairs_validates_references_and_duplicates():
+    left, right = {"A", "B"}, {"X", "Y"}
+    ok = resolve_excluded_pairs(
+        left, right, [ExcludedPair("A", "X"), ExcludedPair("B", "Y")]
+    )
+    assert ok == frozenset({("A", "X"), ("B", "Y")})
+    assert isinstance(ok, frozenset)
+
+    with pytest.raises(ExcludedPairError) as ei:
+        resolve_excluded_pairs(left, right, [ExcludedPair("NOPE", "X")])
+    assert ei.value.index == 0
+    with pytest.raises(ExcludedPairError) as ei:
+        resolve_excluded_pairs(left, right, [ExcludedPair("A", "MISSING")])
+    assert ei.value.index == 0
+    # a right id used as left_id fails the left membership check (wrong side)
+    with pytest.raises(ExcludedPairError) as ei:
+        resolve_excluded_pairs(left, right, [ExcludedPair("X", "Y")])
+    assert ei.value.index == 0
+    with pytest.raises(ExcludedPairError) as ei:
+        resolve_excluded_pairs(
+            left,
+            right,
+            [ExcludedPair("A", "X"), ExcludedPair("A", "X")],
+        )
+    assert ei.value.index == 1
+    assert resolve_excluded_pairs(left, right, []) == frozenset()
+
+
+@pytest.mark.parametrize("seed", range(150))
+def test_excluded_pairs_against_brute_force(seed: int):
+    rng = random.Random(20_000 + seed)
+    n_left = rng.randint(0, 5)
+    n_right = rng.randint(0, 5)
+    left = [
+        Txn(f"L{i}", BASE_TS + rng.randint(0, 4 * 86400),
+            rng.choice([-300, -200, -100, -50, 50, 100, 200, 300]))
+        for i in range(n_left)
+    ]
+    right = [
+        Txn(f"R{i}", BASE_TS + rng.randint(0, 4 * 86400),
+            rng.choice([-300, -200, -100, -50, 50, 100, 200, 300]))
+        for i in range(n_right)
+    ]
+    # every possible cross-side id pair is a valid reference; pick a random set
+    pool = [(t.id, u.id) for t in left for u in right]
+    rng.shuffle(pool)
+    excluded = frozenset(pair for pair in pool if rng.random() < 0.3)
+
+    assert solve(left, right, excluded) == brute_force(left, right, excluded)
+
+
+def test_excluded_pairs_full_batch_stays_optimal_and_deterministic():
+    # dense 12x12 batch (every candidate legal); a fixed exclusion set must
+    # still give a perfect packing (1200), with a deterministic lex result
+    left = [make_txn(f"L{i}", 100) for i in range(12)]
+    right = [make_txn(f"R{i}", 100) for i in range(12)]
+    excluded = {("L0", "R0"), ("L1", "R1"), ("L10", "R10"), ("L11", "R11")}
+    weight, enc = solve(left, right, excluded)
+    assert weight == 1200
+    assert len(enc) == 12
+    used = [id_ for group in enc for side in group for id_ in side]
+    assert len(used) == len(set(used)) == 24
+    for group_l, group_r in enc:
+        for li, ri in zip(group_l, group_r):
+            assert (li, ri) not in excluded
+    # repeated runs are byte-identical (deterministic optimisation)
+    assert solve(left, right, excluded) == (weight, enc)
+
+
+# --------------------------------------------------------------------- #
 # locked groups
 # --------------------------------------------------------------------- #
 def brute_force_locked(
@@ -138,10 +256,11 @@ def brute_force_locked(
     right: list[Txn],
     locked_encs: list,
     free_mask: int,
+    excluded=(),
 ):
     """Like brute_force, but candidates must fit inside ``free_mask`` and the
     locked encodings are folded into the lexicographic comparison."""
-    rec = Reconciler(left, right)
+    rec = Reconciler(left, right, excluded=excluded)
     cands = rec.candidates
     by_txn: list[list[int]] = [[] for _ in rec.txns]
     for ci, c in enumerate(cands):
@@ -181,8 +300,8 @@ def brute_force_locked(
     return best_weight, (best_enc or [])
 
 
-def solve_locked(left: list[Txn], right: list[Txn], locked_specs):
-    rec = Reconciler(left, right)
+def solve_locked(left: list[Txn], right: list[Txn], locked_specs, excluded=()):
+    rec = Reconciler(left, right, excluded=excluded)
     locked = [
         LockedGroup(left_ids=tuple(sorted(l)), right_ids=tuple(sorted(r)))
         for l, r in locked_specs
@@ -262,6 +381,26 @@ def test_locked_groups_against_brute_force(seed: int):
     weight = sum(g.weight for g in groups)
     enc = sorted(g.encoding for g in groups)
 
+    # random exclusions between transactions not consumed by a locked group
+    free_ids = {
+        t.id for t in rec.txns if not ((1 << rec.txns.index(t)) & used_mask)
+    }
+    pool = [
+        (l.id, r.id)
+        for l in left
+        for r in right
+        if l.id in free_ids and r.id in free_ids
+    ]
+    rng.shuffle(pool)
+    excluded = frozenset(pair for pair in pool if rng.random() < 0.3)
+
+    # rebuild with the exclusions so free candidates get filtered; locked
+    # groups, chosen from the unfiltered pool, never contain an excluded pair
+    rec = Reconciler(left, right, excluded=excluded)
+    groups = rec.solve(locked_cands)
+    weight = sum(g.weight for g in groups)
+    enc = sorted(g.encoding for g in groups)
+
     full = (1 << len(rec.txns)) - 1
     locked_encs = [c.encoding for c in locked_cands]
     assert weight == (
@@ -269,8 +408,46 @@ def test_locked_groups_against_brute_force(seed: int):
         + rec._max_value(full ^ used_mask)
     )
     assert enc == brute_force_locked(
-        left, right, locked_encs, full ^ used_mask
+        left, right, locked_encs, full ^ used_mask, excluded
     )[1]
+    # no output group ever contains an excluded pair
+    for group_l, group_r in enc:
+        assert not any((li, ri) in excluded for li in group_l for ri in group_r)
+
+
+def test_locked_group_containing_excluded_pair_rejected():
+    from app.solver import LockedGroupError
+
+    left = [make_txn("A", 300)]
+    right = [make_txn("X", 100), make_txn("Y", 200)]
+    rec = Reconciler(left, right, excluded={("A", "X")})
+    with pytest.raises(LockedGroupError) as ei:
+        resolve_locked_groups(rec, [LockedGroup(("A",), ("X", "Y"))])
+    assert ei.value.index == 0
+    assert "excluded pair" in str(ei.value)
+
+
+def test_locked_group_without_excluded_pair_resolves():
+    left = [make_txn("A", 100), make_txn("B", 50)]
+    right = [make_txn("X", 100), make_txn("Y", 150)]
+    # (A,X) is unaffected by the exclusion (B,Y); remainder still optimised
+    weight, enc = solve_locked(
+        left, right, [(("A",), ("X",))], excluded={("B", "Y")}
+    )
+    assert weight == 100
+    assert enc == [(("A",), ("X",))]
+    # the exclusion also rules (A,Y) out even though A is gone; verify a case
+    # where the free pool still has a legal unaffected alternative
+    left = [make_txn("A", 100), make_txn("B", 50), make_txn("C", 100)]
+    right = [make_txn("X", 100), make_txn("Y", 150), make_txn("Z", 50)]
+    weight, enc = solve_locked(
+        left, right, [(("A",), ("X",))], excluded={("B", "Z")}
+    )
+    assert enc == [
+        (("A",), ("X",)),
+        (("B", "C"), ("Y",)),
+    ]
+    assert weight == 250
 
 
 def test_locked_full_batch():

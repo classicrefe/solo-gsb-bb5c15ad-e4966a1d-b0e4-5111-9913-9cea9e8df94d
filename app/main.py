@@ -13,10 +13,13 @@ from fastapi.responses import Response
 from .idempotency import FingerprintConflict, canonical_fingerprint, store
 from .models import GroupOut, ReconcileRequest, ReconcileResponse
 from .solver import (
+    ExcludedPair,
+    ExcludedPairError,
     LockedGroup,
     LockedGroupError,
     Reconciler,
     Txn,
+    resolve_excluded_pairs,
     resolve_locked_groups,
 )
 
@@ -52,7 +55,31 @@ def solve(payload: ReconcileRequest) -> ReconcileResponse:
     left = [Txn(id=t.id, ts=t.epoch_seconds(), amount=t.amount) for t in payload.left]
     right = [Txn(id=t.id, ts=t.epoch_seconds(), amount=t.amount) for t in payload.right]
 
-    reconciler = Reconciler(left, right)
+    excluded_pairs = []
+    if payload.excluded_pairs:
+        try:
+            excluded = resolve_excluded_pairs(
+                {t.id for t in left},
+                {t.id for t in right},
+                [
+                    ExcludedPair(left_id=p.left_id, right_id=p.right_id)
+                    for p in payload.excluded_pairs
+                ],
+            )
+        except ExcludedPairError as exc:
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "excluded_pair.invalid",
+                        "loc": ["body", "excluded_pairs", exc.index],
+                        "msg": str(exc),
+                        "input": payload.excluded_pairs[exc.index].model_dump(),
+                    }
+                ]
+            )
+        excluded_pairs = list(excluded)
+
+    reconciler = Reconciler(left, right, excluded=excluded_pairs)
 
     locked_cands = []
     if payload.locked_groups:

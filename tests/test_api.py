@@ -28,8 +28,19 @@ def post_locked(left, right, locked):
     )
 
 
+def post_excluded(left, right, excluded, locked=None):
+    body: dict = {"left": left, "right": right, "excluded_pairs": excluded}
+    if locked is not None:
+        body["locked_groups"] = locked
+    return client.post("/reconcile", json=body)
+
+
 def lock(left_ids, right_ids):
     return {"left_ids": list(left_ids), "right_ids": list(right_ids)}
+
+
+def pair(left_id, right_id):
+    return {"left_id": left_id, "right_id": right_id}
 
 
 # --------------------------------------------------------------------- #
@@ -463,6 +474,254 @@ def test_locked_group_schema_errors_422():
             [txn("A", 100)], [txn("X", 100)], [bad]
         )
         assert resp.status_code == 422, bad
+
+
+# --------------------------------------------------------------------- #
+# operator-declared excluded pairs
+# --------------------------------------------------------------------- #
+def test_excluded_pairs_absent_empty_null_keep_result():
+    left, right = [txn("A", 100), txn("B", 50)], [txn("X", 150), txn("Y", 100)]
+    baseline = post(left, right)
+    for value in ([], None):
+        resp = client.post(
+            "/reconcile", json={"left": left, "right": right, "excluded_pairs": value}
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == baseline
+
+
+def test_excluded_pair_redirects_one_to_one_matching():
+    # default optimum pairs (A,X),(B,Y); excluding (A,X) yields (A,Y),(B,X)
+    resp = post_excluded(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [pair("A", "X")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["Y"], "amount": 100},
+        {"left_ids": ["B"], "right_ids": ["X"], "amount": 100},
+    ]
+
+
+def test_excluded_pair_drops_one_to_many_group():
+    # the 300 group (A,[X,Y]) is forbidden via X; the 1-1 group (A,Z) remains
+    resp = post_excluded(
+        [txn("A", 300)],
+        [txn("X", 100), txn("Y", 200), txn("Z", 300)],
+        [pair("A", "X")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["Z"], "amount": 300}
+    ]
+    assert resp.json()["unmatched_right_ids"] == ["X", "Y"]
+
+
+def test_excluded_pair_two_left_one_right():
+    # (A+B,[Y])=300 is forbidden through B; the two 1-1 pairs win instead
+    resp = post_excluded(
+        [txn("A", 100), txn("B", 200)],
+        [txn("X", 100), txn("Y", 300)],
+        [pair("B", "Y")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100}
+    ]
+    assert resp.json()["unmatched_left_ids"] == ["B"]
+    assert resp.json()["unmatched_right_ids"] == ["Y"]
+
+
+def test_excluded_pair_three_left_one_right():
+    # (A+B+C,[Z])=150 is forbidden via C; the two 1-1 pairs still reconcile
+    resp = post_excluded(
+        [txn("A", 50), txn("B", 50), txn("C", 50)],
+        [txn("X", 50), txn("Y", 50), txn("Z", 150)],
+        [pair("C", "Z")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 50},
+        {"left_ids": ["B"], "right_ids": ["Y"], "amount": 50},
+    ]
+    assert resp.json()["unmatched_left_ids"] == ["C"]
+    assert resp.json()["unmatched_right_ids"] == ["Z"]
+
+
+def test_excluded_pair_one_left_three_right():
+    # ([A],[X,Y,Z])=300 forbidden via Y; the 1-1 group (A,W)=300 remains
+    resp = post_excluded(
+        [txn("A", 300)],
+        [txn("W", 300), txn("X", 50), txn("Y", 50), txn("Z", 200)],
+        [pair("A", "Y")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["W"], "amount": 300}
+    ]
+    assert resp.json()["unmatched_right_ids"] == ["X", "Y", "Z"]
+
+
+def test_excluded_pair_reduces_maximum_when_no_alternative():
+    # (A,X) is the only legal group and it is excluded -> nothing reconciles
+    resp = post_excluded(
+        [txn("A", 100), txn("B", 101)],
+        [txn("X", 100), txn("Y", 101)],
+        [pair("A", "X"), pair("B", "Y")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == []
+    assert resp.json()["total_amount"] == 0
+    assert resp.json()["unmatched_left_ids"] == ["A", "B"]
+    assert resp.json()["unmatched_right_ids"] == ["X", "Y"]
+
+
+def test_excluded_pair_lex_tie_break_still_deterministic():
+    # excluding (A,X) forces the other perfect matching, still lex smallest
+    # among the remaining optimal packings
+    resp = post_excluded(
+        [txn("B", 100), txn("A", 100)],
+        [txn("Y", 100), txn("X", 100)],
+        [pair("A", "X")],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["Y"], "amount": 100},
+        {"left_ids": ["B"], "right_ids": ["X"], "amount": 100},
+    ]
+
+
+def test_excluded_pair_applies_with_locked_group_remainder():
+    # locked (A,X) removes A,X; exclusion (B,Z) rules out that free pairing,
+    # so the remainder optimises to (B+C,Y)=150 regardless of Z
+    resp = post_excluded(
+        [txn("A", 100), txn("B", 50), txn("C", 100)],
+        [txn("X", 100), txn("Y", 150), txn("Z", 50)],
+        [pair("B", "Z")],
+        locked=[lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100},
+        {"left_ids": ["B", "C"], "right_ids": ["Y"], "amount": 150},
+    ]
+    assert resp.json()["total_amount"] == 250
+    assert resp.json()["unmatched_right_ids"] == ["Z"]
+
+
+def test_locked_group_hitting_excluded_pair_422():
+    resp = post_excluded(
+        [txn("A", 300)],
+        [txn("X", 100), txn("Y", 200)],
+        [pair("A", "X")],
+        locked=[lock(["A"], ["X", "Y"])],
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "locked_groups", 0]
+    assert "excluded pair" in err["msg"]
+
+
+def test_locked_one_to_many_group_hitting_excluded_pair_422():
+    # any single excluded cross inside a 1-2 locked group rejects the group
+    resp = post_excluded(
+        [txn("L1", 100), txn("L2", 200)],
+        [txn("R1", 300)],
+        [pair("L2", "R1")],
+        locked=[lock(["L1", "L2"], ["R1"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 0]
+
+
+def test_second_locked_group_hitting_excluded_pair_reports_its_index():
+    resp = post_excluded(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [pair("B", "Y")],
+        locked=[lock(["A"], ["X"]), lock(["B"], ["Y"])],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "locked_groups", 1]
+
+
+def test_locked_group_without_excluded_pair_still_accepted():
+    # excluding (A,Y) does not touch the legal locked 1-1 group (A,X)
+    resp = post_excluded(
+        [txn("A", 100)],
+        [txn("X", 100), txn("Y", 200)],
+        [pair("A", "Y")],
+        locked=[lock(["A"], ["X"])],
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["groups"] == [
+        {"left_ids": ["A"], "right_ids": ["X"], "amount": 100}
+    ]
+
+
+def test_excluded_pair_unknown_left_id_422_with_index():
+    resp = post_excluded(
+        [txn("A", 100)], [txn("X", 100)], [pair("NOPE", "X")]
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "excluded_pairs", 0]
+    assert err["type"] == "excluded_pair.invalid"
+    assert "NOPE" in err["msg"]
+
+
+def test_excluded_pair_unknown_right_id_422_with_index():
+    resp = post_excluded(
+        [txn("A", 100)], [txn("X", 100)], [pair("A", "MISSING")]
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "excluded_pairs", 0]
+    assert "MISSING" in err["msg"]
+
+
+def test_excluded_pair_wrong_side_reference_422():
+    # using a right id as left_id, and a left id as right_id, both rejected
+    for bad in (pair("X", "X"), pair("A", "A")):
+        resp = post_excluded([txn("A", 100)], [txn("X", 100)], [bad])
+        assert resp.status_code == 422, bad
+        assert resp.json()["detail"][0]["loc"] == ["body", "excluded_pairs", 0]
+
+
+def test_duplicate_excluded_pair_422_with_index():
+    resp = post_excluded(
+        [txn("A", 100)],
+        [txn("X", 100)],
+        [pair("A", "X"), pair("A", "X")],
+    )
+    assert resp.status_code == 422
+    err = resp.json()["detail"][0]
+    assert err["loc"] == ["body", "excluded_pairs", 1]
+    assert "duplicate" in err["msg"]
+
+
+def test_excluded_pair_first_error_reported():
+    # item 0 is fine; item 2 is the first bad one (unknown right id)
+    resp = post_excluded(
+        [txn("A", 100), txn("B", 100)],
+        [txn("X", 100), txn("Y", 100)],
+        [pair("A", "X"), pair("B", "NOPE"), pair("A", "X")],
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"][0]["loc"] == ["body", "excluded_pairs", 1]
+
+
+def test_excluded_pair_schema_errors_422():
+    # missing fields, empty ids and non-string ids are rejected at schema level
+    for bad in (
+        {"right_id": "X"},
+        {"left_id": "", "right_id": "X"},
+        {"left_id": "A", "right_id": 1},
+    ):
+        resp = post_excluded([txn("A", 100)], [txn("X", 100)], [bad])
+        assert resp.status_code == 422, bad
+        assert "excluded_pairs" in resp.json()["detail"][0]["loc"]
 
 
 # --------------------------------------------------------------------- #

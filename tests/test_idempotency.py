@@ -35,6 +35,14 @@ def body_b():
     return {"left": [txn("L1", 200)], "right": [txn("R1", 200)]}
 
 
+def body_with_exclusion():
+    return {
+        "left": [txn("L1", 100), txn("L2", 100)],
+        "right": [txn("R1", 100), txn("R2", 100)],
+        "excluded_pairs": [{"left_id": "L1", "right_id": "R1"}],
+    }
+
+
 # --------------------------------------------------------------------- #
 # basic replay
 # --------------------------------------------------------------------- #
@@ -130,6 +138,46 @@ def test_distinct_keys_are_independent(client):
     assert r1.status_code == r2.status_code == 200
     assert r1.json()["total_amount"] == 100
     assert r2.json()["total_amount"] == 200
+
+
+def test_excluded_pairs_participate_in_fingerprint_and_replay(client):
+    first = client.post(
+        "/reconcile", json=body_with_exclusion(), headers={"Idempotency-Key": "k-excl"}
+    )
+    assert first.status_code == 200, first.text
+    assert [g["right_ids"] for g in first.json()["groups"]] == [["R2"], ["R1"]]
+
+    # same body replays byte-for-byte without solving again
+    replay = client.post(
+        "/reconcile", json=body_with_exclusion(), headers={"Idempotency-Key": "k-excl"}
+    )
+    assert replay.status_code == 200
+    assert replay.headers["Idempotency-Replayed"] == "true"
+    assert replay.text == first.text
+
+    # dropping the exclusion changes the fingerprint even though the
+    # transaction set is identical -> 409, and the excluded result wins
+    base = {k: v for k, v in body_with_exclusion().items() if k != "excluded_pairs"}
+    conflict = client.post(
+        "/reconcile", json=base, headers={"Idempotency-Key": "k-excl"}
+    )
+    assert conflict.status_code == 409
+
+
+def test_invalid_excluded_pairs_do_not_occupy_key(client):
+    bad = {
+        "left": [txn("L1", 100)],
+        "right": [txn("R1", 100)],
+        "excluded_pairs": [{"left_id": "L1", "right_id": "NOPE"}],
+    }
+    first = client.post("/reconcile", json=bad, headers={"Idempotency-Key": "k-excl-fail"})
+    assert first.status_code == 422
+
+    ok = client.post(
+        "/reconcile", json=body_a(), headers={"Idempotency-Key": "k-excl-fail"}
+    )
+    assert ok.status_code == 200
+    assert "Idempotency-Replayed" not in ok.headers
 
 
 # --------------------------------------------------------------------- #

@@ -12,6 +12,12 @@ may be locked at most once, and every locked group is forced into the solution;
 the global maximum / lexicographic tie-break is then computed over the
 remaining (unlocked) transactions only.
 
+A batch may also carry *excluded pairs*: ``(left id, right id)`` pairs an
+operator declares must never share a group.  A candidate containing both ids
+of an excluded pair is dropped during generation, so it can neither be picked
+by the solver nor referenced as a locked group -- the latter is reported as an
+error rather than silently ignoring the exclusion.
+
 Group legality rules:
   * shapes: 1-1, or a single record on one side with 2-3 on the other;
   * every amount in the group shares the same sign;
@@ -23,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
-from typing import Sequence
+from typing import Collection, Sequence
 
 MAX_SPAN_SECONDS = 48 * 3600  # 48 hours, inclusive
 # (left count, right count) shapes: 1-1 plus one-to-many (2..3) in both directions.
@@ -68,6 +74,48 @@ class LockedGroupError(ValueError):
         super().__init__(f"locked_groups[{index}]: {message}")
 
 
+@dataclass(frozen=True)
+class ExcludedPair:
+    """A ``(left id, right id)`` pair that must never share a group."""
+
+    left_id: str
+    right_id: str
+
+
+class ExcludedPairError(ValueError):
+    """An excluded pair fails validation; ``index`` is its 0-based list index."""
+
+    def __init__(self, index: int, message: str) -> None:
+        self.index = index
+        super().__init__(f"excluded_pairs[{index}]: {message}")
+
+
+def resolve_excluded_pairs(
+    left_ids: set[str],
+    right_ids: set[str],
+    pairs: Sequence[ExcludedPair],
+) -> frozenset[tuple[str, str]]:
+    """Validate operator-declared exclusions and return them as a set.
+
+    Each pair must reference an existing left id and an existing right id
+    (a wrong-side reference fails the corresponding membership check), and no
+    pair may repeat.  The first offending item's 0-based index is reported.
+    """
+    resolved: set[tuple[str, str]] = set()
+    for pi, pair in enumerate(pairs):
+        if pair.left_id not in left_ids:
+            raise ExcludedPairError(pi, f"unknown left transaction id: {pair.left_id}")
+        if pair.right_id not in right_ids:
+            raise ExcludedPairError(pi, f"unknown right transaction id: {pair.right_id}")
+        key = (pair.left_id, pair.right_id)
+        if key in resolved:
+            raise ExcludedPairError(
+                pi, f"duplicate excluded pair: {pair.left_id} / {pair.right_id}"
+            )
+        resolved.add(key)
+    return frozenset(resolved)
+
+
 def resolve_locked_groups(
     rec: "Reconciler",
     locked: Sequence[LockedGroup],
@@ -76,8 +124,8 @@ def resolve_locked_groups(
 
     Checks, in input order: duplicated ids inside a single group, references to
     ids that do not exist on the referenced side, reuse of a transaction across
-    groups, and the common legality rules (shape / sign / equal sums / 48h).
-    The first offending group's 0-based index is reported.
+    groups, the exclusion rules, and the common legality rules (shape / sign /
+    equal sums / 48h).  The first offending group's 0-based index is reported.
     """
     left_ids = {t.id for t in rec.left}
     right_ids = {t.id for t in rec.right}
@@ -100,6 +148,10 @@ def resolve_locked_groups(
         enc = (tuple(sorted(lids)), tuple(sorted(rids)))
         cand = rec.by_encoding.get(enc)
         if cand is None:
+            # The encoding is well-formed and references valid ids, so the only
+            # way it is missing is a legality failure -- possibly an exclusion.
+            if any((li, ri) in rec.excluded for li in lids for ri in rids):
+                raise LockedGroupError(gi, "group contains an excluded pair")
             raise LockedGroupError(gi, "group violates shape/sign/amount/48h rules")
         resolved.append(cand)
     return resolved
@@ -111,12 +163,15 @@ class Reconciler:
         left: list[Txn],
         right: list[Txn],
         locked: Sequence[Candidate] = (),
+        excluded: Collection[tuple[str, str]] = (),
     ) -> None:
         self.left = left
         self.right = right
         self.txns = left + right
         self.n_left = len(left)
         self.locked: list[Candidate] = list(locked)
+        # ``(left id, right id)`` pairs that must never share a candidate.
+        self.excluded: frozenset[tuple[str, str]] = frozenset(excluded)
         self.amounts = [t.amount for t in self.txns]
         self.candidates: list[Candidate] = self._generate_candidates()
         # encoding -> candidate; each encoding maps to exactly one candidate
@@ -155,6 +210,15 @@ class Reconciler:
                         continue
                     times = [left[i].ts for i in lcomb] + [right[j].ts for j in rcomb]
                     if max(times) - min(times) > MAX_SPAN_SECONDS:
+                        continue
+                    # operator exclusions: a group containing both members of
+                    # an excluded pair is not a legal candidate at all
+                    excluded = self.excluded
+                    if excluded and any(
+                        (left[i].id, right[j].id) in excluded
+                        for i in lcomb
+                        for j in rcomb
+                    ):
                         continue
                     mask = 0
                     for i in lcomb:
