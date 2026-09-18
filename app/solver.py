@@ -12,6 +12,11 @@ may be locked at most once, and every locked group is forced into the solution;
 the global maximum / lexicographic tie-break is then computed over the
 remaining (unlocked) transactions only.
 
+A batch may also carry *excluded pairs*: (left id, right id) pairs an operator
+declares must never share a reconciliation group.  Any candidate containing
+both members of an excluded pair is dropped before optimisation, and a locked
+group containing one is rejected outright.
+
 Group legality rules:
   * shapes: 1-1, or a single record on one side with 2-3 on the other;
   * every amount in the group shares the same sign;
@@ -60,12 +65,63 @@ class LockedGroup:
     right_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ExcludedPair:
+    """A (left id, right id) pair that must never share a reconciliation group."""
+
+    left_id: str
+    right_id: str
+
+
 class LockedGroupError(ValueError):
     """A locked group fails validation; ``index`` is its 0-based list index."""
 
     def __init__(self, index: int, message: str) -> None:
         self.index = index
         super().__init__(f"locked_groups[{index}]: {message}")
+
+
+class ExcludedPairError(ValueError):
+    """An excluded pair fails validation; ``index`` is its 0-based list index."""
+
+    def __init__(self, index: int, message: str) -> None:
+        self.index = index
+        super().__init__(f"excluded_pairs[{index}]: {message}")
+
+
+def resolve_excluded_pairs(
+    left_ids: set[str],
+    right_ids: set[str],
+    pairs: Sequence[ExcludedPair],
+) -> set[tuple[str, str]]:
+    """Validate operator-declared excluded pairs.
+
+    Checks, in input order: the left id must exist on the left side and the
+    right id on the right side (an id on the wrong side is reported as such),
+    and the same (left_id, right_id) pair may not appear twice.  The first
+    offending pair's 0-based index is reported.  Returns the validated pairs.
+    """
+    seen: set[tuple[str, str]] = set()
+    resolved: set[tuple[str, str]] = set()
+    for pi, pair in enumerate(pairs):
+        lid, rid = pair.left_id, pair.right_id
+        if lid not in left_ids:
+            if lid in right_ids:
+                raise ExcludedPairError(
+                    pi, f"left_id {lid!r} references a right-side transaction"
+                )
+            raise ExcludedPairError(pi, f"unknown left transaction id: {lid}")
+        if rid not in right_ids:
+            if rid in left_ids:
+                raise ExcludedPairError(
+                    pi, f"right_id {rid!r} references a left-side transaction"
+                )
+            raise ExcludedPairError(pi, f"unknown right transaction id: {rid}")
+        if (lid, rid) in seen:
+            raise ExcludedPairError(pi, f"duplicate excluded pair: ({lid}, {rid})")
+        seen.add((lid, rid))
+        resolved.add((lid, rid))
+    return resolved
 
 
 def resolve_locked_groups(
@@ -76,7 +132,8 @@ def resolve_locked_groups(
 
     Checks, in input order: duplicated ids inside a single group, references to
     ids that do not exist on the referenced side, reuse of a transaction across
-    groups, and the common legality rules (shape / sign / equal sums / 48h).
+    groups, presence of an operator-declared excluded pair, and the common
+    legality rules (shape / sign / equal sums / 48h).
     The first offending group's 0-based index is reported.
     """
     left_ids = {t.id for t in rec.left}
@@ -97,6 +154,16 @@ def resolve_locked_groups(
             raise LockedGroupError(gi, f"transaction reused by another group: {reused[0]}")
         seen.update(lids)
         seen.update(rids)
+        excluded_hit = sorted(
+            (lid, rid)
+            for lid, rid in rec.excluded_pairs
+            if lid in lids and rid in rids
+        )
+        if excluded_hit:
+            lid, rid = excluded_hit[0]
+            raise LockedGroupError(
+                gi, f"group contains an excluded pair: ({lid}, {rid})"
+            )
         enc = (tuple(sorted(lids)), tuple(sorted(rids)))
         cand = rec.by_encoding.get(enc)
         if cand is None:
@@ -111,12 +178,23 @@ class Reconciler:
         left: list[Txn],
         right: list[Txn],
         locked: Sequence[Candidate] = (),
+        excluded_pairs: Sequence[tuple[str, str]] = (),
     ) -> None:
         self.left = left
         self.right = right
         self.txns = left + right
         self.n_left = len(left)
         self.locked: list[Candidate] = list(locked)
+        self.left_index = {t.id: i for i, t in enumerate(left)}
+        self.right_index = {t.id: i for i, t in enumerate(right)}
+        # excluded pairs kept both as (left id, right id) -- for locked-group
+        # validation -- and as global transaction index pairs used to prune
+        # generated candidates
+        self.excluded_pairs: frozenset[tuple[str, str]] = frozenset(excluded_pairs)
+        self.excluded_index_pairs: frozenset[tuple[int, int]] = frozenset(
+            (self.left_index[lid], self.n_left + self.right_index[rid])
+            for lid, rid in self.excluded_pairs
+        )
         self.amounts = [t.amount for t in self.txns]
         self.candidates: list[Candidate] = self._generate_candidates()
         # encoding -> candidate; each encoding maps to exactly one candidate
@@ -138,6 +216,14 @@ class Reconciler:
     # ------------------------------------------------------------------ #
     # candidate generation
     # ------------------------------------------------------------------ #
+    def _contains_excluded_pair(self, lcomb, rcomb) -> bool:
+        """True if the group formed by the two index combinations includes
+        both members of any operator-declared excluded pair."""
+        rglobal = {self.n_left + j for j in rcomb}
+        return any(
+            li in lcomb and ri in rglobal for li, ri in self.excluded_index_pairs
+        )
+
     def _generate_candidates(self) -> list[Candidate]:
         cands: list[Candidate] = []
         left, right, n_left = self.left, self.right, self.n_left
@@ -152,6 +238,8 @@ class Reconciler:
                         continue
                     amounts = [left[i].amount for i in lcomb] + [right[j].amount for j in rcomb]
                     if not (all(a > 0 for a in amounts) or all(a < 0 for a in amounts)):
+                        continue
+                    if self._contains_excluded_pair(lcomb, rcomb):
                         continue
                     times = [left[i].ts for i in lcomb] + [right[j].ts for j in rcomb]
                     if max(times) - min(times) > MAX_SPAN_SECONDS:

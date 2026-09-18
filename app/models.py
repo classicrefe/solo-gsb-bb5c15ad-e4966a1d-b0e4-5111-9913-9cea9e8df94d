@@ -49,6 +49,18 @@ class LockedGroupIn(BaseModel):
     right_ids: list[StrictStr] = Field(min_length=1, max_length=3)
 
 
+class ExcludedPairIn(BaseModel):
+    """An operator-declared pair that must never share a reconciliation group.
+
+    ``left_id`` must reference an id from ``left`` and ``right_id`` an id from
+    ``right``.  Semantic validation (unknown ids, wrong side, duplicate pairs)
+    happens in the endpoint and returns 422 with the offending pair's index.
+    """
+
+    left_id: StrictStr = Field(min_length=1, max_length=128)
+    right_id: StrictStr = Field(min_length=1, max_length=128)
+
+
 class ReconcileRequest(BaseModel):
     """Batch of fund flows from two sides (at most 12 each)."""
 
@@ -57,6 +69,13 @@ class ReconcileRequest(BaseModel):
     locked_groups: list[LockedGroupIn] | None = Field(
         default=None,
         description="Optional operator-confirmed groups forced into the solution.",
+    )
+    excluded_pairs: list[ExcludedPairIn] | None = Field(
+        default=None,
+        description=(
+            "Optional (left_id, right_id) pairs that must never end up in the "
+            "same reconciliation group."
+        ),
     )
 
 

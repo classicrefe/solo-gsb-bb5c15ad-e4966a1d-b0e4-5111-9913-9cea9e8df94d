@@ -36,6 +36,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   ],
   "locked_groups": [
     { "left_ids": ["L1"], "right_ids": ["R1", "R2"] }
+  ],
+  "excluded_pairs": [
+    { "left_id": "L1", "right_id": "R3" }
   ]
 }
 ```
@@ -79,6 +82,47 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 求解时**全部锁定组都会被保留**，其流水从候选池中移除；只在剩余流水上执行原有的
 “核销金额绝对值总和最大 + 组编码列表字典序最小”求解。最终 `groups` 为锁定组与
 自由求解结果的合并（仍按组编码升序），`total_amount` 与 `unmatched_*` 均按合并结果计算。
+
+### 排除对（`excluded_pairs`，可选）
+
+`excluded_pairs` 用于让操作员声明**绝不能归入同一个核销组**的左右流水对；每项形如
+`{"left_id": "L1", "right_id": "R1"}`。不传该字段或传 `[]` / `null` 时，响应与原行为
+完全一致。
+
+校验规则（任一不满足均返回 **422**，错误 `loc` 为
+`["body", "excluded_pairs", <序号>]`，`<序号>` 为出问题项从 0 开始的下标，按数组顺序
+报告首个错误）：
+
+- `left_id` 必须引用本批次 left 的 ID：不存在报 `unknown left transaction id`，
+  实际是 right 侧 ID 时报侧别错误；
+- `right_id` 必须引用本批次 right 的 ID：不存在报 `unknown right transaction id`，
+  实际是 left 侧 ID 时报侧别错误；
+- 同一个 `(left_id, right_id)` 对不得重复出现，否则报 `duplicate excluded pair`。
+
+```json
+{
+  "detail": [
+    {
+      "type": "excluded_pair.invalid",
+      "loc": ["body", "excluded_pairs", 0],
+      "msg": "excluded_pairs[0]: unknown left transaction id: NOPE",
+      "input": { "left_id": "NOPE", "right_id": "R1" }
+    }
+  ]
+}
+```
+
+校验通过后，生成候选组时**只要组内同时包含某个排除对的两侧 ID 就直接剔除该候选组**
+（一对一与一对多组形均适用），其余候选组继续按“最大核销额 + 字典序最小”规则求解；
+响应结构不变，被排除规则影响而无法成组的流水照常进入 `unmatched_*`。
+
+若某个人工 `locked_groups` 命中排除对（锁定组中同时包含该对两侧 ID），同样返回
+**422**，错误 `loc` 为 `["body", "locked_groups", <锁定组序号>]`——排除规则不会被
+静默忽略。排除对与未命中的锁定组可以并存：锁定组照旧强制保留，自由候选池在剔除
+违规候选后继续优化。
+
+与其它请求字段一样，`excluded_pairs` 参与 `Idempotency-Key` 的请求指纹：相同键搭配
+不同的排除对集合会返回 **409**。
 
 
 **核销组规则**
@@ -152,6 +196,10 @@ curl -X POST http://localhost:8000/reconcile \
 存在 `locked_groups` 时，先将全部锁定组（已通过同样的合法性校验）对应的流水从
 位掩码中剔除，再对剩余掩码执行步骤 2、3，最后把锁定组并入结果。
 
+存在 `excluded_pairs` 时，步骤 1 枚举候选组会直接丢弃任何同时包含某个排除对两侧
+ID 的候选组（锁定组若命中排除对则在求解前返回 422），步骤 2、3 在剩余候选集上
+照常执行。
+
 实测 12×12 极端稠密批次求解耗时约 50ms 以内。
 
 ## 测试
@@ -161,7 +209,8 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups` 的场景）。
+包含 API 行为测试与求解器对暴力枚举的随机差分测试（含带 `locked_groups`、
+`excluded_pairs` 以及二者组合的场景）。
 
 ## 项目结构
 
